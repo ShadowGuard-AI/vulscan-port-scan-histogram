@@ -70,6 +70,9 @@ def parse_targets(ip_range):
     anything else, including plain names: a target the tool cannot
     resolve to addresses is an error, never a finding.
     """
+    # strict=False is deliberate on my part: 192.168.1.5/24 means the
+    # /24 around that address, not an error. I would rather scan the
+    # range the operator pointed at than argue about host bits.
     try:
         network = ipaddress.ip_network(ip_range, strict=False)
     except ValueError:
@@ -79,6 +82,8 @@ def parse_targets(ip_range):
         except ValueError:
             raise ValueError(f"Invalid IP range or address: {ip_range}")
     hosts = list(network.hosts()) if network.num_addresses > 1 else [network.network_address]
+    # The 256 host cap is my guardrail against fat-fingering a /16 and
+    # spending the afternoon on it. Narrow the range and run it again.
     if len(hosts) > MAX_HOSTS:
         raise ValueError(f"Range {ip_range} contains {len(hosts)} hosts; the limit is {MAX_HOSTS}. Narrow the range.")
     return hosts
@@ -88,6 +93,8 @@ def select_ports(args):
     """Returns the concrete port list to scan from --ports or --top-ports."""
     if args.ports:
         ports = []
+        # I do not dedupe this list. Ask for 80 twice and it is scanned
+        # twice, and an open result counts twice in the histogram.
         for item in args.ports.split(","):
             item = item.strip()
             if not item:
@@ -101,6 +108,8 @@ def select_ports(args):
     else:
         if args.top_ports < 1:
             raise ValueError("--top-ports must be at least 1.")
+        # The built in list holds 50 ports, so asking for the top 100
+        # just takes all 50. The cap is the list, not the number given.
         ports = TOP_PORTS[: args.top_ports]
     if len(ports) > MAX_PORTS:
         raise ValueError(f"{len(ports)} ports requested; the limit is {MAX_PORTS}.")
@@ -109,6 +118,9 @@ def select_ports(args):
 
 def _connect(host, port, timeout):
     """One TCP connect attempt. Returns 'open', 'refused', or 'unreachable'."""
+    # The except order matters here: ConnectionRefusedError is an
+    # OSError subclass, so it has to be caught before the catch-all or
+    # every refused port would read as unreachable.
     try:
         with socket.create_connection((str(host), port), timeout=timeout):
             return "open"
@@ -131,6 +143,9 @@ def scan_ports(hosts, ports, timeout):
     """
     logging.info(f"Scanning {len(hosts)} host(s) on {len(ports)} port(s) each.")
     pairs = [(host, port) for host in hosts for port in ports]
+    # pool.map returns in submission order, so the zip below pairs each
+    # outcome with the host and port that produced it. That ordering is
+    # the whole reason I use map here instead of as_completed.
     with ThreadPoolExecutor(max_workers=64) as pool:
         outcomes = list(pool.map(lambda hp: _connect(hp[0], hp[1], timeout), pairs))
 
@@ -142,6 +157,8 @@ def scan_ports(hosts, ports, timeout):
             port_counts[port] += 1
             open_by_host[host].append(port)
             reached.add(host)
+        # A refusal still proves the host answered, so it counts as
+        # reached. Only silence reads as unreached.
         elif outcome == "refused":
             reached.add(host)
     for host in hosts:
@@ -163,6 +180,8 @@ def generate_histogram(port_counts, output_path):
     counts = [port_counts[p] for p in ports]
 
     plt.figure()
+    # The empty chart is a real outcome, not a failure: hosts answered
+    # and nothing was open, and the title below says exactly that.
     if ports:
         plt.bar([str(p) for p in ports], counts, color='skyblue')
         plt.title('Histogram of Open Ports')
@@ -199,6 +218,8 @@ def main():
         logging.error(f"Scan failed: {e}")
         return 1
 
+    # No answers at all means I have nothing to chart and nothing to
+    # claim. Exit 1 and leave no PNG behind to be misread later.
     if hosts_reached == 0:
         logging.error("No host in the range responded; the scan produced no results and no histogram was generated.")
         return 1
