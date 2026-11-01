@@ -1,12 +1,28 @@
 import argparse
-import requests
-from bs4 import BeautifulSoup
+import ipaddress
 import logging
+import socket
+import sys
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+
 import matplotlib.pyplot as plt
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Common ports, in the order the --top-ports option scans them.
+TOP_PORTS = [
+    80, 443, 22, 21, 25, 3389, 110, 995, 143, 993,
+    465, 587, 53, 8080, 8443, 3306, 5432, 6379, 27017, 1433,
+    1521, 2049, 5900, 8000, 8888, 9200, 9300, 11211, 5060, 161,
+    389, 636, 873, 1080, 3128, 4444, 5555, 6666, 7777, 9999,
+    10000, 32768, 49152, 62078, 27015, 25565, 19132, 51820, 1194, 1723,
+]
+
+MAX_HOSTS = 256
+MAX_PORTS = 1000
+
 
 def setup_argparse():
     """
@@ -16,101 +32,186 @@ def setup_argparse():
         argparse.Namespace: Parsed command-line arguments.
     """
     parser = argparse.ArgumentParser(
-        description="Generates a histogram of open ports across a given IP range and scans for web application vulnerabilities."
+        description="Runs a real TCP connect scan of the given IP range and generates a histogram of the open ports found. A port histogram makes no vulnerability findings, and none are reported."
     )
     parser.add_argument(
         "--ip-range",
         required=True,
-        help="IP range to scan in CIDR format (e.g., 192.168.1.0/24)."
+        help="IP range to scan in CIDR format (e.g., 192.168.1.0/24), or a single IP address."
     )
     parser.add_argument(
         "--top-ports",
         type=int,
         default=100,
-        help="Number of top ports to scan (default: 100)."
+        help="Scan the first N ports of the built in common ports list (default: 100, capped at the list length)."
+    )
+    parser.add_argument(
+        "--ports",
+        help="Comma-separated list of ports to scan, overriding --top-ports (e.g., 80,443,9511)."
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=0.5,
+        help="Per-connection timeout in seconds (default: 0.5)."
     )
     parser.add_argument(
         "--output",
-        help="File path to save the histogram image (optional)."
+        help="File path to save the histogram image (default: port_scan_histogram.png in the working directory)."
     )
     return parser.parse_args()
 
-def scan_ports(ip_range, top_ports):
-    """
-    Scans the specified IP range for open ports.
 
-    Args:
-        ip_range (str): The IP range in CIDR format.
-        top_ports (int): Number of top ports to scan.
+def parse_targets(ip_range):
+    """
+    Parses the --ip-range value into a list of host addresses.
+
+    Accepts CIDR notation or a single IP address. Raises ValueError on
+    anything else, including plain names: a target the tool cannot
+    resolve to addresses is an error, never a finding.
+    """
+    try:
+        network = ipaddress.ip_network(ip_range, strict=False)
+    except ValueError:
+        try:
+            single = ipaddress.ip_address(ip_range)
+            network = ipaddress.ip_network(f"{single}/32" if single.version == 4 else f"{single}/128")
+        except ValueError:
+            raise ValueError(f"Invalid IP range or address: {ip_range}")
+    hosts = list(network.hosts()) if network.num_addresses > 1 else [network.network_address]
+    if len(hosts) > MAX_HOSTS:
+        raise ValueError(f"Range {ip_range} contains {len(hosts)} hosts; the limit is {MAX_HOSTS}. Narrow the range.")
+    return hosts
+
+
+def select_ports(args):
+    """Returns the concrete port list to scan from --ports or --top-ports."""
+    if args.ports:
+        ports = []
+        for item in args.ports.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            port = int(item)
+            if port < 1 or port > 65535:
+                raise ValueError(f"Invalid port: {port}")
+            ports.append(port)
+        if not ports:
+            raise ValueError("--ports was given but contained no ports.")
+    else:
+        if args.top_ports < 1:
+            raise ValueError("--top-ports must be at least 1.")
+        ports = TOP_PORTS[: args.top_ports]
+    if len(ports) > MAX_PORTS:
+        raise ValueError(f"{len(ports)} ports requested; the limit is {MAX_PORTS}.")
+    return ports
+
+
+def _connect(host, port, timeout):
+    """One TCP connect attempt. Returns 'open', 'refused', or 'unreachable'."""
+    try:
+        with socket.create_connection((str(host), port), timeout=timeout):
+            return "open"
+    except ConnectionRefusedError:
+        return "refused"
+    except (socket.timeout, TimeoutError, OSError):
+        return "unreachable"
+
+
+def scan_ports(hosts, ports, timeout):
+    """
+    Runs a real TCP connect scan of every host and port pair.
 
     Returns:
-        dict: A dictionary with ports as keys and their occurrence count as values.
+        tuple: (port_counts, hosts_reached, open_by_host) where
+        port_counts counts open ports across all hosts, hosts_reached
+        counts hosts that answered at all (an open port or a refusal,
+        both of which prove the host responded), and open_by_host maps
+        each host to its sorted list of open ports.
     """
-    # Simulated code for port scanning (replace with actual port scan logic)
-    logging.info(f"Scanning IP range: {ip_range} for top {top_ports} ports.")
-    simulated_results = [80, 443, 22, 80, 8080, 22, 80, 443, 3306, 8080]
-    port_counts = Counter(simulated_results)
-    logging.info("Port scanning completed.")
-    return port_counts
+    logging.info(f"Scanning {len(hosts)} host(s) on {len(ports)} port(s) each.")
+    pairs = [(host, port) for host in hosts for port in ports]
+    with ThreadPoolExecutor(max_workers=64) as pool:
+        outcomes = list(pool.map(lambda hp: _connect(hp[0], hp[1], timeout), pairs))
 
-def scan_vulnerabilities(ip):
+    port_counts = Counter()
+    open_by_host = {host: [] for host in hosts}
+    reached = set()
+    for (host, port), outcome in zip(pairs, outcomes):
+        if outcome == "open":
+            port_counts[port] += 1
+            open_by_host[host].append(port)
+            reached.add(host)
+        elif outcome == "refused":
+            reached.add(host)
+    for host in hosts:
+        open_by_host[host] = sorted(open_by_host[host])
+        if open_by_host[host]:
+            logging.info(f"{host}: open ports {', '.join(str(p) for p in open_by_host[host])}")
+    logging.info(f"Port scanning completed. {len(reached)} of {len(hosts)} host(s) responded, {sum(port_counts.values())} open port(s) found.")
+    return port_counts, len(reached), open_by_host
+
+
+def generate_histogram(port_counts, output_path):
     """
-    Scans a given IP for common web application vulnerabilities.
-
-    Args:
-        ip (str): The IP address to scan.
-
-    Returns:
-        list: List of detected vulnerabilities.
-    """
-    # Simulated vulnerability scanning (replace with real HTTP analysis logic)
-    logging.info(f"Scanning IP {ip} for web application vulnerabilities.")
-    simulated_vulnerabilities = ["SQL Injection", "XSS"]
-    return simulated_vulnerabilities
-
-def generate_histogram(port_counts, output_path=None):
-    """
-    Generates a histogram of open ports.
-
-    Args:
-        port_counts (dict): Dictionary with ports as keys and their occurrence counts as values.
-        output_path (str, optional): Path to save the histogram image. Defaults to None.
+    Generates a histogram of open ports counted by the scan and saves it
+    to output_path. With no open ports the chart is empty and its title
+    says so; the counts are the scan's real results either way.
     """
     logging.info("Generating histogram for open ports.")
-    ports = list(port_counts.keys())
-    counts = list(port_counts.values())
+    ports = sorted(port_counts.keys())
+    counts = [port_counts[p] for p in ports]
 
-    plt.bar(ports, counts, color='skyblue')
+    plt.figure()
+    if ports:
+        plt.bar([str(p) for p in ports], counts, color='skyblue')
+        plt.title('Histogram of Open Ports')
+    else:
+        plt.bar([], [])
+        plt.title('Histogram of Open Ports (none found)')
     plt.xlabel('Ports')
     plt.ylabel('Frequency')
-    plt.title('Histogram of Open Ports')
-    if output_path:
-        plt.savefig(output_path)
-        logging.info(f"Histogram saved to {output_path}.")
-    else:
-        plt.show()
+    plt.savefig(output_path)
+    plt.close()
+    logging.info(f"Histogram saved to {output_path}.")
+
 
 def main():
     """
     Main function to orchestrate the tool's operations.
+
+    Returns an exit code: 0 when the scan ran against at least one
+    responding host, 1 on invalid input or when no host responded, in
+    which case no histogram is produced and no result is claimed.
     """
     args = setup_argparse()
 
     try:
-        # Perform port scanning
-        port_counts = scan_ports(args.ip_range, args.top_ports)
+        hosts = parse_targets(args.ip_range)
+        ports = select_ports(args)
+    except ValueError as e:
+        logging.error(str(e))
+        return 1
 
-        # Generate histogram
-        generate_histogram(port_counts, args.output)
-
-        # Simulate vulnerability scanning for the first IP in the range
-        logging.info("Performing vulnerability scan for the first IP in the range.")
-        first_ip = args.ip_range.split('/')[0]
-        vulnerabilities = scan_vulnerabilities(first_ip)
-        logging.info(f"Vulnerabilities detected on {first_ip}: {', '.join(vulnerabilities)}")
-
+    try:
+        port_counts, hosts_reached, _open_by_host = scan_ports(hosts, ports, args.timeout)
     except Exception as e:
-        logging.error(f"An error occurred: {e}")
+        logging.error(f"Scan failed: {e}")
+        return 1
+
+    if hosts_reached == 0:
+        logging.error("No host in the range responded; the scan produced no results and no histogram was generated.")
+        return 1
+
+    output_path = args.output if args.output else "port_scan_histogram.png"
+    try:
+        generate_histogram(port_counts, output_path)
+    except Exception as e:
+        logging.error(f"Failed to generate histogram: {e}")
+        return 1
+
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
